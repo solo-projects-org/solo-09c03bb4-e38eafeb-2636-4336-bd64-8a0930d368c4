@@ -1,0 +1,27 @@
+# 模拟 PACS 镜像（与 API 共用同一基础镜像，仅入口不同）
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10002 pacsuser
+
+WORKDIR /srv
+
+COPY requirements.txt ./
+# 模拟 PACS 只需要 pynetdicom/pydicom；整包安装以保持镜像一致、简单
+RUN pip install --no-cache-dir pynetdicom==3.0.4 pydicom==3.0.2
+
+COPY simulator ./simulator
+COPY simulator/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh && chown -R pacsuser:pacsuser /srv
+
+# 入口以 root 处理卷属主后通过 gosu 降权为 pacsuser
+USER root
+
+EXPOSE 11112
+ENTRYPOINT ["./entrypoint.sh"]

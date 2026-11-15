@@ -1,0 +1,80 @@
+# DICOM CT 离线取数流水线 —— 可启动演示环境
+# 服务：
+#   api   FastAPI(Swagger) + C-STORE SCP + C-FIND/C-MOVE SCU + SQLite
+#   pacs  pynetdicom 模拟 PACS，内含虚构合成 CT，慢回传 + 重复投送
+#   demo  一次性端到端演示（交错回传 / 重复投送 / 清单外拒收 / 保存失败 / 重启恢复）
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dicom-retrieval-api:latest
+    environment:
+      APP_AET: RETRIEVER
+      APP_HOST: 0.0.0.0
+      STORE_PORT: "11113"
+      PACS_AET: MYPACS
+      PACS_HOST: pacs
+      PACS_PORT: "11112"
+      DATA_DIR: /data
+      ACSE_TIMEOUT: "30"
+      DIMSE_TIMEOUT: "300"
+      NETWORK_TIMEOUT: "300"
+    ports:
+      - "8000:8000"     # Swagger / REST
+      - "11113:11113"   # DICOM C-STORE SCP
+    volumes:
+      - api-data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    depends_on:
+      pacs:
+        condition: service_started
+
+  pacs:
+    build:
+      context: .
+      dockerfile: Dockerfile.pacs
+    image: dicom-sim-pacs:latest
+    environment:
+      PACS_AET: MYPACS
+      PACS_PORT: "11112"
+      PACS_DATA_DIR: /data/pacs
+      APP_AET: RETRIEVER
+      DEST_HOST: api
+      DEST_PORT: "11113"
+      # 慢回传：每个实例间隔 1 秒，便于观察多批交错、互不阻塞
+      MOVE_DELAY: "1.0"
+      # 每 3 个实例重复投送一次，验证接收端去重
+      MOVE_DUPLICATE_EVERY: "3"
+      STUDY_COUNTS: "8,6,5"
+    ports:
+      - "11112:11112"
+    volumes:
+      - pacs-data:/data
+    restart: always
+
+  demo:
+    image: dicom-retrieval-api:latest
+    user: "10001:10001"
+    entrypoint: ["python", "-m", "demo.run_demo"]
+    environment:
+      PACS_HOST: pacs
+      PACS_PORT: "11112"
+      APP_AET: RETRIEVER
+    depends_on:
+      api:
+        condition: service_healthy
+      pacs:
+        condition: service_started
+    # 演示容器默认不自动运行，避免干扰手动体验：
+    #   docker compose run --rm demo
+    profiles: ["demo"]
+
+volumes:
+  api-data:
+  pacs-data:

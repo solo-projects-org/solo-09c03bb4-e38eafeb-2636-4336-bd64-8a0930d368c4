@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# 运行期数据卷（容器内挂载，本地不入库）
+data/
+*.db
+*.db-wal
+*.db-shm
+*.zip
+*.part
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/

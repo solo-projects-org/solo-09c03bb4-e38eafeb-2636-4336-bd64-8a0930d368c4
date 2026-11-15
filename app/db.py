@@ -87,6 +87,7 @@ class Database:
                     transfer_syntax     TEXT NOT NULL,
                     file_path           TEXT NOT NULL,
                     received_at         TEXT NOT NULL,
+                    size_bytes          INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (batch_id, sop_instance_uid)
                 );
 
@@ -100,6 +101,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_events_batch
                     ON events(batch_id, id);
                 """
+            )
+            self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """对既有数据卷做轻量迁移（SQLite 不支持 IF NOT EXISTS 加列）。"""
+        cols = {
+            r["name"] for r in self._conn.execute(
+                "PRAGMA table_info(instances)"
+            ).fetchall()
+        }
+        if "size_bytes" not in cols:
+            self._conn.execute(
+                "ALTER TABLE instances ADD COLUMN size_bytes "
+                "INTEGER NOT NULL DEFAULT 0"
             )
 
     def close(self) -> None:
@@ -269,7 +284,12 @@ class Database:
         return row is not None
 
     def register_instance(
-        self, batch_id: str, sop_uid: str, file_path: str, transfer_syntax: str
+        self,
+        batch_id: str,
+        sop_uid: str,
+        file_path: str,
+        transfer_syntax: str,
+        size_bytes: int = 0,
     ) -> bool:
         """登记一个已落盘实例。返回 False 表示重复投送（不重复计数）。"""
         with self._lock, self._conn:
@@ -283,8 +303,9 @@ class Database:
                 return False  # 重复实例
             self._conn.execute(
                 "UPDATE instances SET file_path = ?, transfer_syntax = ?, "
-                "received_at = ? WHERE batch_id = ? AND sop_instance_uid = ?",
-                (file_path, transfer_syntax, _now(), batch_id, sop_uid),
+                "size_bytes = ?, received_at = ? WHERE batch_id = ? AND sop_instance_uid = ?",
+                (file_path, transfer_syntax, size_bytes, _now(),
+                 batch_id, sop_uid),
             )
             self._conn.execute(
                 "UPDATE batches SET received_count = received_count + 1, updated_at = ? "
@@ -292,6 +313,20 @@ class Database:
                 (_now(), batch_id),
             )
         return True
+
+    def clear_instance_registration(self, batch_id: str, sop_uid: str) -> None:
+        """重启恢复：文件缺失时清空登记（回到“清单内未接收”状态）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE instances SET file_path = '', received_at = '', "
+                "size_bytes = 0 WHERE batch_id = ? AND sop_instance_uid = ?",
+                (batch_id, sop_uid),
+            )
+            self._conn.execute(
+                "UPDATE batches SET received_count = (SELECT COUNT(*) FROM instances "
+                "WHERE batch_id = ? AND file_path != '') WHERE id = ?",
+                (batch_id, batch_id),
+            )
 
     def received_progress(self, batch_id: str) -> tuple[int, int]:
         with self._lock:

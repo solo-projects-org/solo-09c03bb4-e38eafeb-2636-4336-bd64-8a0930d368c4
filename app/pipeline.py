@@ -13,6 +13,7 @@ from .db import (
     STATE_PENDING,
     Database,
 )
+from .quota import QuotaManager
 
 log = logging.getLogger("pipeline")
 
@@ -137,8 +138,19 @@ class Pipeline:
 
 
 # ---------------------------------------------------------------- recovery
-def recover_on_startup(db: Database) -> None:
-    """重启恢复：未完成批一律失败；完成批缺失 ZIP 则补建。"""
+def recover_on_startup(db: Database, quota: QuotaManager | None = None) -> None:
+    """重启恢复。
+
+    顺序很重要：
+
+    1. 先按数据卷中**实际保留的文件**重建配额占用，并清理未登记残件
+       （``.part``、未登记 ``.dcm``、孤儿批目录），保证配额不被幽灵占用；
+    2. 未完成批一律置 FAILED（迟到回传不可恢复），其已存文件仍计入配额；
+    3. 已完成批缺失 ZIP 则按登记文件补建，继续可下载。
+    """
+    if quota is not None:
+        storage.reconcile_volume(db, quota)
+
     for batch in db.non_terminal_batches():
         db.fail_batch(
             batch["id"],

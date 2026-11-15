@@ -29,6 +29,7 @@ from .db import (
     STATE_MOVING,
     Database,
 )
+from .quota import QuotaExceeded, get_quota
 
 log = logging.getLogger("dicom")
 
@@ -108,51 +109,86 @@ def handle_c_store(event: evt.Event, db: Database) -> Dataset:
         log.warning("批 %s 收到清单外实例 %s，拒收", batch_id, sop_uid)
         return _store_status(STORE_CANNOT_UNDERSTAND, "not in manifest")
 
-    # 重复实例：不重复计数、不重复写盘，直接回成功（源端重发是合法重试）
+    # 重复实例：不重复计数、不重复写盘、不再占额，直接回成功（源端重发是合法重试）
     if db.is_already_received(batch_id, sop_uid):
         db.add_event(
             "STORE_DUPLICATE",
-            f"重复实例 SOP={sop_uid}，不重复计数",
+            f"重复实例 SOP={sop_uid}，不重复计数不占额度",
             batch_id,
         )
         log.info("批 %s 重复实例 %s，忽略", batch_id, sop_uid)
         return _store_status(STORE_SUCCESS)
 
-    # ---- 关键顺序：先写盘（含 fsync），再登记；登记失败则删文件 ----
+    # ---- 先按实例实际大小编码，再预留数据卷额度 ----
     try:
-        path = storage.write_dataset(batch_id, ds, ts)
+        payload = storage.encode_dataset(ds, ts)
+    except Exception as exc:  # 编码失败：无文件无预留，直接判失败
+        db.fail_batch(batch_id, f"实例编码失败：{exc}")
+        log.exception("批 %s 实例 %s 编码失败", batch_id, sop_uid)
+        return _store_status(STORE_DATASET_ERROR, "encode failed")
+    instance_size = len(payload)
+
+    quota = get_quota()
+    try:
+        token = quota.reserve(batch_id, instance_size)
+    except QuotaExceeded as exc:
+        # 仅让当前批失败并说明缺口；不触碰其它批已占/预留额度
+        reason = (
+            f"数据卷额度不足，批失败：缺口 {exc.gap} 字节"
+            f"（本实例 {exc.size} 字节，配额 {exc.limit} 字节，"
+            f"已占 {exc.used} 字节）"
+        )
+        db.fail_batch(batch_id, reason)
+        db.add_event("QUOTA_EXCEEDED", reason, batch_id)
+        log.warning("批 %s 额度不足：%s", batch_id, exc)
+        # 0xA700 Out-of-resources 语义贴合“资源/容量不足”
+        return _store_status(STORE_OUT_OF_RESOURCES, "quota exceeded")
+
+    # ---- 关键顺序：先写盘（含 fsync），再登记；任一步失败只释放本次预留 ----
+    try:
+        path = storage.write_dataset(batch_id, ds, ts, payload=payload)
     except storage.StorageError as exc:
+        quota.release(batch_id, token, instance_size)
         db.fail_batch(batch_id, f"保存失败：{exc}")
         log.error("批 %s 保存实例 %s 失败，批置 FAILED：%s", batch_id, sop_uid, exc)
         return _store_status(STORE_OUT_OF_RESOURCES, str(exc))
 
     try:
-        registered = db.register_instance(batch_id, sop_uid, str(path), ts)
-    except Exception as exc:  # 登记本身故障：删除文件，回失败，置批失败
+        registered = db.register_instance(
+            batch_id, sop_uid, str(path), ts, size_bytes=instance_size
+        )
+    except Exception as exc:  # 登记本身故障：删除文件、释放本次预留，回失败置批失败
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+        quota.release(batch_id, token, instance_size)
         db.fail_batch(batch_id, f"登记失败：{exc}")
         log.exception("批 %s 登记实例 %s 失败", batch_id, sop_uid)
         return _store_status(STORE_OUT_OF_RESOURCES, "registration failed")
 
     if not registered:
-        # 并发重发竞态兜底：另一线程已登记，删除本次文件，按重复处理
+        # 并发重发竞态兜底：另一线程已登记，删除本次文件、释放本次预留，按重复处理
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        db.add_event("STORE_DUPLICATE", f"并发重复 SOP={sop_uid}，不重复计数", batch_id)
+        quota.release(batch_id, token, instance_size)
+        db.add_event("STORE_DUPLICATE", f"并发重复 SOP={sop_uid}，不重复计数不占额度",
+                     batch_id)
         return _store_status(STORE_SUCCESS)
+
+    # 写盘与登记均成功：在途预留转为已存占用
+    quota.commit(batch_id, token, instance_size)
 
     expected, received = db.received_progress(batch_id)
     db.add_event(
         "STORE_RECEIVED",
-        f"已接收 SOP={sop_uid}（{received}/{expected}）",
+        f"已接收 SOP={sop_uid}（{received}/{expected}，{instance_size} 字节）",
         batch_id,
     )
-    log.info("批 %s 接收实例 %s（%d/%d）", batch_id, sop_uid, received, expected)
+    log.info("批 %s 接收实例 %s（%d/%d，%d 字节）",
+             batch_id, sop_uid, received, expected, instance_size)
     return _store_status(STORE_SUCCESS)
 
 

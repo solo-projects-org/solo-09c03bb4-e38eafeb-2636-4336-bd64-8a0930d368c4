@@ -1,8 +1,9 @@
 # DICOM CT 离线取数流水线 —— 可启动演示环境
 # 服务：
-#   api   FastAPI(Swagger) + C-STORE SCP + C-FIND/C-MOVE SCU + SQLite
+#   api   FastAPI(Swagger) + C-STORE SCP + C-FIND/C-MOVE SCU + SQLite + 字节配额
 #   pacs  pynetdicom 模拟 PACS，内含虚构合成 CT，慢回传 + 重复投送
-#   demo  一次性端到端演示（交错回传 / 重复投送 / 清单外拒收 / 保存失败 / 重启恢复）
+#   demo  一次性端到端演示（交错回传 / 重复投送 / 清单外拒收 / 保存失败 /
+#         额度不足仅该批失败 / 重启恢复配额）
 services:
   api:
     build:
@@ -20,6 +21,12 @@ services:
       ACSE_TIMEOUT: "30"
       DIMSE_TIMEOUT: "300"
       NETWORK_TIMEOUT: "300"
+      # 数据卷 DICOM 实例字节配额（所有批共享；0=不限额）。
+      # 合成 CT 每实例约 9.2KB：8 实例检查 ≈73.6KB、6 实例 ≈55.2KB、
+      # 5 实例 ≈46KB。165KB（=168960B）足够前三个演示批（A/B 正常 +
+      # C 保存失败，实际落盘仅 A/B≈128.8KB）完整演出；随后的批 D
+      # 只会收到部分实例即触发“额度不足仅该批失败”，并打印具体缺口。
+      QUOTA_LIMIT_BYTES: "168960"
     ports:
       - "8000:8000"     # Swagger / REST
       - "11113:11113"   # DICOM C-STORE SCP

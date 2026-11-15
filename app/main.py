@@ -19,6 +19,7 @@ from .db import (
     set_db,
 )
 from .pipeline import Pipeline, recover_on_startup
+from .quota import QuotaManager, set_quota
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,19 +30,27 @@ log = logging.getLogger("api")
 # 进程级单例（lifespan 中初始化）
 db: Database | None = None
 pipeline: Pipeline | None = None
+quota: QuotaManager | None = None
 _scp_server = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, pipeline, _scp_server
+    global db, pipeline, quota, _scp_server
     settings.ensure_dirs()
     db = Database(settings.DB_PATH)
     set_db(db)
-    recover_on_startup(db)
+    quota = QuotaManager(settings.QUOTA_LIMIT_BYTES)
+    set_quota(quota)
+    # 先按卷中实际文件重建配额、清理未登记残件，再恢复批状态
+    recover_on_startup(db, quota)
     _scp_server = dicom.start_store_scp(db)
     pipeline = Pipeline(db)
-    log.info("API 就绪，数据卷=%s", settings.DATA_DIR)
+    log.info(
+        "API 就绪，数据卷=%s，字节配额=%s",
+        settings.DATA_DIR,
+        "不限额" if quota.unlimited else f"{quota.limit_bytes} 字节",
+    )
     try:
         yield
     finally:
@@ -53,13 +62,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DICOM CT 离线取数流水线",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "提交 StudyInstanceUID → C-FIND 固定 SOP 清单 → C-MOVE 回传 → "
         "C-STORE 接收非压缩 CT → 核对收齐后打包 ZIP 下载。\n\n"
-        "规则：清单外实例不入包、重复实例不重复计数、保存失败即批失败、"
-        "失败批迟到回传不可恢复、重启后未完成批判失败。"
+        "规则：清单外实例不入包、重复实例不重复计数不占额度、"
+        "C-STORE 写盘前按实例实际大小预留数据卷字节配额（所有批共享）、"
+        "额度不足仅当前批失败并说明缺口、保存/登记失败只释放本次预留、"
+        "失败批迟到回传不可恢复、重启后按卷内实际文件恢复配额并清理残件。"
     ),
 )
 
@@ -88,9 +99,22 @@ class BatchView(BaseModel):
     created_at: str
     updated_at: str
     downloadable: bool
+    stored_bytes: int = Field(
+        0, description="该批已写盘登记实例占用的字节数"
+    )
+    reserved_bytes: int = Field(
+        0, description="该批在途预留（已预留尚未登记完成）的字节数"
+    )
+    quota_total_bytes: int = Field(
+        0, description="该批当前合计占用（已存 + 在途预留）字节数"
+    )
 
 
 def _view(row: dict) -> BatchView:
+    snap = quota.snapshot() if quota is not None else None
+    bq = snap.batches.get(row["id"], {}) if snap else {}
+    stored = int(bq.get("stored_bytes", 0))
+    reserved = int(bq.get("reserved_bytes", 0))
     return BatchView(
         id=row["id"],
         study_instance_uid=row["study_instance_uid"],
@@ -103,6 +127,24 @@ def _view(row: dict) -> BatchView:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         downloadable=row["state"] == STATE_COMPLETED and bool(row["zip_path"]),
+        stored_bytes=stored,
+        reserved_bytes=reserved,
+        quota_total_bytes=stored + reserved,
+    )
+
+
+class QuotaView(BaseModel):
+    unlimited: bool = Field(..., description="true 表示未配置上限（QUOTA_LIMIT_BYTES=0）")
+    limit_bytes: int = Field(..., description="配额上限字节数；0 表示不限额")
+    stored_bytes: int = Field(..., description="所有批已存实例文件字节合计")
+    reserved_bytes: int = Field(..., description="所有批在途预留字节合计")
+    used_bytes: int = Field(..., description="已存 + 在途预留合计")
+    available_bytes: int | None = Field(
+        None, description="剩余可用字节；不限额时为 null"
+    )
+    batches: dict[str, dict] = Field(
+        default_factory=dict,
+        description="每个批的占用明细：stored_bytes/reserved_bytes/total_bytes",
     )
 
 
@@ -185,10 +227,28 @@ def download_zip(batch_id: str) -> FileResponse:
     )
 
 
+@app.get("/quota", response_model=QuotaView, tags=["quota"],
+         summary="查询数据卷字节配额与各批占用（已存 + 在途预留）")
+def get_quota_view() -> QuotaView:
+    snap = quota.snapshot()
+    return QuotaView(
+        unlimited=snap.unlimited,
+        limit_bytes=snap.limit_bytes,
+        stored_bytes=snap.stored_bytes,
+        reserved_bytes=snap.reserved_bytes,
+        used_bytes=snap.used_bytes,
+        available_bytes=snap.available_bytes,
+        batches=snap.batches,
+    )
+
+
 @app.get("/health", tags=["system"], summary="健康检查")
 def health() -> dict:
+    snap = quota.snapshot()
     return {"status": "ok", "store_port": settings.STORE_PORT,
-            "ae_title": settings.APP_AET}
+            "ae_title": settings.APP_AET,
+            "quota_limit_bytes": snap.limit_bytes,
+            "quota_used_bytes": snap.used_bytes}
 
 
 # ------------------------------------------------------------------ debug

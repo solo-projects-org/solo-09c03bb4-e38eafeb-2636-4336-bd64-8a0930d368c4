@@ -34,6 +34,11 @@ class Settings:
     BATCHES_DIR: Path = DATA_DIR / "batches"
     ZIP_DIR: Path = DATA_DIR / "zips"
 
+    # ---- 数据卷字节配额（仅统计 DICOM 实例文件 + 在途预留）----
+    # 0 表示不限制；>0 时所有批的已存文件与在途预留合计不得超过该值。
+    # 重启后按卷中实际保留的实例文件重建已占额度。
+    QUOTA_LIMIT_BYTES: int = _int("QUOTA_LIMIT_BYTES", 0)
+
     @classmethod
     def ensure_dirs(cls) -> None:
         cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
